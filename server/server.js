@@ -9,16 +9,14 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
 let worker;
 let router;
 
-// Use objects (dictionaries) instead of arrays for easy lookup by ID
 const transports = {};
 const producers = {};
+const rooms = {}; // Track rooms and their producers
 
 async function createWorker() {
   worker = await mediasoup.createWorker({
@@ -26,10 +24,7 @@ async function createWorker() {
     rtcMaxPort: 49999,
   });
   console.log(`Mediasoup Worker PID: ${worker.pid}`);
-  worker.on("died", () => {
-    console.error("Mediasoup worker died!");
-    setTimeout(() => process.exit(1), 2000);
-  });
+  worker.on("died", () => setTimeout(() => process.exit(1), 2000));
 }
 
 async function createRouter() {
@@ -48,11 +43,20 @@ async function start() {
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
-    socket.on("getRouterRtpCapabilities", (data, callback) => {
+    // 1. Join Room
+    socket.on("joinRoom", ({ roomId }, callback) => {
+      socket.join(roomId); // Socket.io built-in room feature
+      socket.roomId = roomId;
+
+      if (!rooms[roomId]) rooms[roomId] = [];
+
+      // Send back existing producers in this room
+      callback({ existingProducers: rooms[roomId] });
+    });
+    socket.on("getRouterRtpCapabilities", (_, callback) => {
       callback({ routerRtpCapabilities: router.rtpCapabilities });
     });
 
-    // Create Transport and save it by its transport.id
     socket.on("createWebRtcTransport", async (_, callback) => {
       try {
         const transport = await router.createWebRtcTransport({
@@ -61,9 +65,7 @@ async function start() {
           enableTcp: true,
           preferUdp: true,
         });
-
         transports[transport.id] = { socketId: socket.id, transport };
-
         callback({
           id: transport.id,
           iceParameters: transport.iceParameters,
@@ -75,7 +77,6 @@ async function start() {
       }
     });
 
-    // Connect Transport using transportId
     socket.on(
       "connectTransport",
       async ({ dtlsParameters, transportId }, callback) => {
@@ -83,13 +84,10 @@ async function start() {
         if (transportEntry) {
           await transportEntry.transport.connect({ dtlsParameters });
           callback({ connected: true });
-        } else {
-          callback({ error: "Transport not found" });
         }
       }
     );
 
-    // Produce using transportId
     socket.on(
       "transportProduce",
       async ({ kind, rtpParameters, transportId }, callback) => {
@@ -99,23 +97,36 @@ async function start() {
             kind,
             rtpParameters,
           });
-          producers[producer.id] = { socketId: socket.id, producer };
+          producers[producer.id] = {
+            socketId: socket.id,
+            producer,
+            roomId: socket.roomId,
+          };
 
-          socket.broadcast.emit("newProducer", { producerId: producer.id });
+          // Add to room list
+          if (rooms[socket.roomId]) {
+            rooms[socket.roomId].push({
+              producerId: producer.id,
+              socketId: socket.id,
+            });
+          }
+
+          // Notify others in the room
+          socket.to(socket.roomId).emit("newProducer", {
+            producerId: producer.id,
+            socketId: socket.id,
+          });
           callback({ id: producer.id });
         }
       }
     );
 
-    // Consume using transportId
     socket.on(
       "consume",
       async ({ rtpCapabilities, producerId, transportId }, callback) => {
         try {
-          if (!router.canConsume({ producerId, rtpCapabilities })) {
+          if (!router.canConsume({ producerId, rtpCapabilities }))
             return callback({ error: "Cannot consume" });
-          }
-
           const transportEntry = transports[transportId];
           if (!transportEntry) return callback({ error: "No transport" });
 
@@ -124,7 +135,6 @@ async function start() {
             rtpCapabilities,
             paused: false,
           });
-
           callback({
             id: consumer.id,
             producerId,
@@ -132,16 +142,39 @@ async function start() {
             rtpParameters: consumer.rtpParameters,
           });
         } catch (err) {
-          console.error("Consume error:", err);
           callback({ error: err.message });
         }
       }
     );
+
+    // 2. Handle Disconnect (Cleanup)
+    socket.on("disconnect", () => {
+      console.log("User disconnected:", socket.id);
+      if (socket.roomId && rooms[socket.roomId]) {
+        // Remove this user's producers from the room
+        rooms[socket.roomId] = rooms[socket.roomId].filter(
+          (p) => p.socketId !== socket.id
+        );
+
+        // Tell everyone else in the room to remove this user's video
+        socket.to(socket.roomId).emit("user-left", { socketId: socket.id });
+      }
+    });
+
+    socket.on("chatMessage", ({ roomId, text }, cb) => {
+      socket.to(roomId).emit("chatMessage", { from: socket.id, text });
+    });
+    socket.on("reaction", ({ roomId, emoji }) => {
+      socket.to(roomId).emit("reaction", { emoji });
+    });
+    socket.on("micToggle", ({ roomId, muted }) => {
+      socket.to(roomId).emit("micToggle", { socketId: socket.id, muted });
+    });
   });
 
-  server.listen(3001, () => {
-    console.log("Backend server running on http://localhost:3001");
-  });
+  server.listen(3001, () =>
+    console.log("Backend server running on http://localhost:3001")
+  );
 }
 
 start();
